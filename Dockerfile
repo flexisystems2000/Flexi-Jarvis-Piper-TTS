@@ -5,22 +5,43 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PIPER_VOICE=en_US-lessac-low
 
-# Install FFmpeg with Opus encoding support
+# ==================================================
+# INSTALL FFMPEG AND OPUS ENCODER
+# ==================================================
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Confirm FFmpeg and libopus are available
+RUN ffmpeg -version && \
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopus
+
+# ==================================================
+# INSTALL PYTHON DEPENDENCIES
+# ==================================================
+
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download Piper voice
+# ==================================================
+# DOWNLOAD PIPER VOICE
+# ==================================================
+
 RUN python -m piper.download_voices \
     --download-dir /app/voices \
     en_US-lessac-low
 
-# Copy application
+# ==================================================
+# COPY APPLICATION
+# ==================================================
+
 COPY app.py .
+
+# ==================================================
+# START SERVER
+# ==================================================
 
 EXPOSE 10000
 

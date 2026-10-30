@@ -1,21 +1,23 @@
-
 import os
 import io
 import hmac
 import wave
+import shutil
 import logging
 import subprocess
 import tempfile
 
 from pathlib import Path
+
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from piper import PiperVoice
 
-# --------------------------------------------------
+
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 app = FastAPI(title="Jarvis Piper TTS")
 
@@ -29,9 +31,9 @@ VOICE_PATH = Path("/app/voices/en_US-lessac-low.onnx")
 voice = None
 
 
-# --------------------------------------------------
+# ==================================================
 # LOAD PIPER VOICE
-# --------------------------------------------------
+# ==================================================
 
 @app.on_event("startup")
 def load_voice():
@@ -44,6 +46,7 @@ def load_voice():
             )
 
         voice = PiperVoice.load(str(VOICE_PATH))
+
         logger.info("Piper voice loaded successfully")
 
     except Exception:
@@ -51,17 +54,17 @@ def load_voice():
         raise
 
 
-# --------------------------------------------------
+# ==================================================
 # REQUEST MODEL
-# --------------------------------------------------
+# ==================================================
 
 class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=500)
 
 
-# --------------------------------------------------
-# HOME
-# --------------------------------------------------
+# ==================================================
+# HOME ENDPOINT
+# ==================================================
 
 @app.get("/")
 def home():
@@ -73,28 +76,26 @@ def home():
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/health")
 def health():
+
+    ffmpeg_path = shutil.which("ffmpeg")
+
     return {
         "status": "ok",
         "voice_loaded": voice is not None,
-        "ffmpeg_available": (
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            ).returncode == 0
-        )
+        "ffmpeg_available": ffmpeg_path is not None
     }
 
 
-# --------------------------------------------------
-# GENERATE OGG/OPUS AUDIO
-# --------------------------------------------------
+# ==================================================
+# TEXT TO SPEECH
+# WAV -> OGG/OPUS
+# ==================================================
 
 @app.post("/tts")
 def generate_audio(
@@ -102,7 +103,10 @@ def generate_audio(
     x_api_key: str = Header(default="")
 ):
 
-    # API KEY CHECK
+    # ----------------------------------------------
+    # CHECK API KEY
+    # ----------------------------------------------
+
     if not API_KEY:
         raise HTTPException(
             status_code=503,
@@ -115,16 +119,35 @@ def generate_audio(
             detail="Invalid API key"
         )
 
+    # ----------------------------------------------
+    # CHECK PIPER VOICE
+    # ----------------------------------------------
+
     if voice is None:
         raise HTTPException(
             status_code=503,
             detail="Piper voice is not loaded"
         )
 
+    # ----------------------------------------------
+    # CHECK FFMPEG
+    # ----------------------------------------------
+
+    ffmpeg_path = shutil.which("ffmpeg")
+
+    if not ffmpeg_path:
+        logger.error("FFmpeg is not installed")
+
+        raise HTTPException(
+            status_code=503,
+            detail="FFmpeg is not installed"
+        )
+
     try:
-        # ------------------------------------------
-        # STEP 1: GENERATE WAV USING PIPER
-        # ------------------------------------------
+
+        # ==========================================
+        # STEP 1: GENERATE WAV AUDIO
+        # ==========================================
 
         audio_buffer = io.BytesIO()
 
@@ -134,27 +157,40 @@ def generate_audio(
         wav_data = audio_buffer.getvalue()
 
         if not wav_data:
-            raise RuntimeError("Piper generated empty audio")
+            raise RuntimeError(
+                "Piper generated empty WAV audio"
+            )
 
-        # ------------------------------------------
+        # ==========================================
         # STEP 2: CONVERT WAV TO OGG/OPUS
-        # ------------------------------------------
+        # ==========================================
 
         with tempfile.TemporaryDirectory() as temp_dir:
 
-            wav_path = os.path.join(temp_dir, "speech.wav")
-            opus_path = os.path.join(temp_dir, "speech.ogg")
+            wav_path = os.path.join(
+                temp_dir,
+                "speech.wav"
+            )
 
+            opus_path = os.path.join(
+                temp_dir,
+                "speech.ogg"
+            )
+
+            # Save WAV temporarily
             with open(wav_path, "wb") as wav_file:
                 wav_file.write(wav_data)
 
+            # Convert using FFmpeg
             result = subprocess.run(
                 [
-                    "ffmpeg",
+                    ffmpeg_path,
                     "-y",
                     "-hide_banner",
                     "-loglevel", "error",
                     "-i", wav_path,
+                    "-map_metadata", "-1",
+                    "-vn",
                     "-c:a", "libopus",
                     "-b:a", "32k",
                     "-vbr", "on",
@@ -170,22 +206,46 @@ def generate_audio(
             )
 
             if result.returncode != 0:
-                logger.error("FFmpeg error: %s", result.stderr)
-                raise RuntimeError("Opus conversion failed")
 
+                logger.error(
+                    "FFmpeg conversion failed: %s",
+                    result.stderr
+                )
+
+                raise RuntimeError(
+                    "WAV to OGG/Opus conversion failed"
+                )
+
+            # Read converted audio
             with open(opus_path, "rb") as opus_file:
                 opus_data = opus_file.read()
 
-        if not opus_data:
-            raise RuntimeError("FFmpeg generated empty Opus audio")
+        # ==========================================
+        # STEP 3: VALIDATE OGG OUTPUT
+        # ==========================================
 
-        # ------------------------------------------
-        # STEP 3: RETURN OGG/OPUS AUDIO
-        # ------------------------------------------
+        if not opus_data:
+            raise RuntimeError(
+                "FFmpeg generated empty audio"
+            )
+
+        if not opus_data.startswith(b"OggS"):
+            raise RuntimeError(
+                "Generated audio is not a valid OGG container"
+            )
+
+        # ==========================================
+        # STEP 4: RETURN OGG/OPUS AUDIO
+        # ==========================================
+
+        logger.info(
+            "Successfully generated OGG/Opus audio (%s bytes)",
+            len(opus_data)
+        )
 
         return Response(
             content=opus_data,
-            media_type="audio/ogg; codecs=opus",
+            media_type="audio/ogg",
             headers={
                 "Content-Disposition":
                     'attachment; filename="speech.ogg"',
@@ -194,14 +254,25 @@ def generate_audio(
         )
 
     except subprocess.TimeoutExpired:
-        logger.exception("Audio conversion timed out")
+
+        logger.exception(
+            "FFmpeg audio conversion timed out"
+        )
+
         raise HTTPException(
             status_code=504,
             detail="Audio conversion timed out"
         )
 
+    except HTTPException:
+        raise
+
     except Exception:
-        logger.exception("Speech generation failed")
+
+        logger.exception(
+            "Speech generation failed"
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Speech generation failed"

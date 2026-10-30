@@ -19,17 +19,27 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from piper import PiperVoice
 
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
 app = FastAPI(title="Jarvis Piper TTS + YouTube")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jarvis-media")
 
 API_KEY = os.environ.get("PIPER_API_KEY", "")
+
 NOVASTACK_BASE_URL = os.environ.get(
     "NOVASTACK_BASE_URL",
     "https://api-novastack.vercel.app"
 ).rstrip("/")
+
 NOVASTACK_API_KEY = os.environ.get("NOVASTACK_KEY", "")
-NOVASTACK_TIMEOUT = float(os.environ.get("NOVASTACK_TIMEOUT", "90"))
+NOVASTACK_TIMEOUT = float(
+    os.environ.get("NOVASTACK_TIMEOUT", "90")
+)
 
 VOICE_PATH = Path("/app/voices/en_US-lessac-low.onnx")
 
@@ -40,6 +50,7 @@ DOWNLOAD_POLL_INTERVAL = 2
 DOWNLOAD_POLL_TIMEOUT = 120
 
 YOUTUBE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
 YOUTUBE_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -63,7 +74,10 @@ def require_api_key(x_api_key: str):
         )
 
     if not hmac.compare_digest(x_api_key or "", API_KEY):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
 
 
 def require_novastack_config():
@@ -75,7 +89,7 @@ def require_novastack_config():
 
 
 # =========================================================
-# PIPER TTS
+# PIPER VOICE
 # =========================================================
 
 @app.on_event("startup")
@@ -99,6 +113,56 @@ def load_voice():
 class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=500)
 
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.get("/")
+def home():
+    return {
+        "service": "Jarvis Piper TTS + YouTube",
+        "status": "online",
+        "endpoints": {
+            "tts": "POST /tts",
+            "youtube_search": "GET /youtube/search?q=JAMB",
+            "youtube_video": "GET /youtube/video?url=VIDEO_URL",
+            "youtube_download": "GET /youtube/download?url=VIDEO_URL",
+            "youtube_audio": "GET /youtube/audio?url=VIDEO_URL",
+            "novastack_voice_models": "GET /novastack/voice/models",
+            "novastack_model_voices": "GET /novastack/voices/MODEL_ID",
+            "novastack_voice_model": "GET /novastack/voice/model",
+            "novastack_generate_voice": "POST /novastack/voice/MODEL_ID",
+            "novastack_voice_job": "GET /novastack/voice/jobs/JOB_ID",
+            "health": "GET /health"
+        },
+        "audio_format": "ogg-opus",
+        "youtube_audio_format": "mp3",
+        "youtube_audio_conversion": "local-ffmpeg"
+    }
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "voice_loaded": voice is not None,
+        "ffmpeg_available": shutil.which("ffmpeg") is not None,
+        "ffprobe_available": shutil.which("ffprobe") is not None,
+        "novastack_configured": bool(NOVASTACK_API_KEY),
+        "novastack_base_url": (
+            NOVASTACK_BASE_URL if NOVASTACK_API_KEY else None
+        )
+    }
+
+
+# =========================================================
+# PIPER TTS
+# =========================================================
 
 @app.post("/tts")
 def generate_audio(
@@ -189,6 +253,11 @@ def generate_audio(
                 "Generated audio is not a valid OGG container"
             )
 
+        logger.info(
+            "Generated OGG/Opus audio (%s bytes)",
+            len(opus_data)
+        )
+
         return Response(
             content=opus_data,
             media_type="audio/ogg",
@@ -200,7 +269,7 @@ def generate_audio(
         )
 
     except subprocess.TimeoutExpired:
-        logger.exception("FFmpeg audio conversion timed out")
+        logger.exception("FFmpeg conversion timed out")
         raise HTTPException(
             status_code=504,
             detail="Audio conversion timed out"
@@ -218,46 +287,6 @@ def generate_audio(
 
 
 # =========================================================
-# HOME AND HEALTH
-# =========================================================
-
-@app.get("/")
-def home():
-    return {
-        "service": "Jarvis Piper TTS + YouTube",
-        "status": "online",
-        "endpoints": {
-            "tts": "POST /tts",
-            "youtube_search": "GET /youtube/search?q=JAMB",
-            "youtube_video": "GET /youtube/video?url=VIDEO_URL",
-            "youtube_download": "GET /youtube/download?url=VIDEO_URL",
-            "youtube_audio": "GET /youtube/audio?url=VIDEO_URL",
-            "novastack_voice_models": "GET /novastack/voice/models",
-            "novastack_model_voices": "GET /novastack/voices/MODEL_ID",
-            "novastack_voice_model": "GET /novastack/voice/model",
-            "novastack_generate_voice": "POST /novastack/voice/MODEL_ID",
-            "novastack_voice_job": "GET /novastack/voice/jobs/JOB_ID",
-            "health": "GET /health"
-        },
-        "audio_format": "ogg-opus",
-        "youtube_audio_format": "mp3"
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "voice_loaded": voice is not None,
-        "ffmpeg_available": shutil.which("ffmpeg") is not None,
-        "youtube_extractor_available": True,
-        "novastack_configured": bool(NOVASTACK_API_KEY),
-        "novastack_base_url":
-            NOVASTACK_BASE_URL if NOVASTACK_API_KEY else None
-    }
-
-
-# =========================================================
 # NOVASTACK REQUEST PROXY
 # =========================================================
 
@@ -271,7 +300,9 @@ async def novastack_request(
 ):
     require_novastack_config()
 
-    headers = {"x-api-key": NOVASTACK_API_KEY}
+    headers = {
+        "x-api-key": NOVASTACK_API_KEY
+    }
 
     if content_type:
         headers["content-type"] = content_type
@@ -398,6 +429,7 @@ async def novastack_generate_voice(
     require_api_key(x_api_key)
 
     body = await request.body()
+
     content_type = request.headers.get(
         "content-type",
         "application/json"
@@ -433,12 +465,10 @@ async def novastack_voice_job(
 
 
 # =========================================================
-# NOVASTACK YOUTUBE HELPERS
+# NOVASTACK JSON HELPER
 # =========================================================
 
 async def novastack_json(path: str, params=None):
-    """GET a NovaStack route and return parsed JSON."""
-
     require_novastack_config()
 
     async with httpx.AsyncClient(
@@ -452,7 +482,9 @@ async def novastack_json(path: str, params=None):
         upstream = await client.get(
             f"{NOVASTACK_BASE_URL}{path}",
             params=params,
-            headers={"x-api-key": NOVASTACK_API_KEY}
+            headers={
+                "x-api-key": NOVASTACK_API_KEY
+            }
         )
 
     logger.info(
@@ -473,6 +505,10 @@ async def novastack_json(path: str, params=None):
             f"NovaStack returned invalid JSON for {path}"
         )
 
+
+# =========================================================
+# YOUTUBE HELPERS
+# =========================================================
 
 def unwrap(payload):
     if (
@@ -512,8 +548,6 @@ def format_duration(seconds):
 
 
 def parse_youtube_url(raw_url: str):
-    """Return video ID and normalized YouTube watch URL."""
-
     parsed = urlparse(raw_url.strip())
     host = (parsed.hostname or "").lower()
 
@@ -674,7 +708,7 @@ async def youtube_search(
 
 
 # =========================================================
-# YOUTUBE VIDEO METADATA
+# YOUTUBE VIDEO INFORMATION
 # =========================================================
 
 @app.get("/youtube/video")
@@ -718,12 +752,63 @@ async def youtube_video_info(
 
 
 # =========================================================
-# DOWNLOAD JOB POLLING
+# VIDEO DURATION CHECK
+# =========================================================
+
+async def check_video_duration(watch_url: str):
+    info = unwrap(
+        await novastack_json(
+            "/v1/youtube/metadata",
+            {"url": watch_url}
+        )
+    )
+
+    if not isinstance(info, dict):
+        return
+
+    duration = info.get("duration")
+
+    if duration and int(duration) > MAX_VIDEO_DURATION:
+        raise RuntimeError(
+            "Video is longer than the 15 minute limit"
+        )
+
+
+# =========================================================
+# CREATE NOVASTACK VIDEO JOB
+# =========================================================
+
+async def create_youtube_job(endpoint: str, watch_url: str):
+    payload = unwrap(
+        await novastack_json(
+            endpoint,
+            {"url": watch_url}
+        )
+    )
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "NovaStack returned an invalid download job response"
+        )
+
+    job_id = (
+        payload.get("job_id")
+        or payload.get("id")
+    )
+
+    if not job_id:
+        raise RuntimeError(
+            "NovaStack did not return a Job ID"
+        )
+
+    return str(job_id)
+
+
+# =========================================================
+# POLL NOVASTACK DOWNLOAD JOB
 # =========================================================
 
 async def wait_for_download_url(job_id: str):
-    """Poll NovaStack until a video or audio file is ready."""
-
     waited = 0
 
     while waited < DOWNLOAD_POLL_TIMEOUT:
@@ -742,8 +827,15 @@ async def wait_for_download_url(job_id: str):
             job.get("status", "")
         ).lower()
 
-        if status in ("done", "completed", "complete", "success"):
-            size = int(job.get("file_size_bytes") or 0)
+        if status in (
+            "done",
+            "completed",
+            "complete",
+            "success"
+        ):
+            size = int(
+                job.get("file_size_bytes") or 0
+            )
 
             if size > MAX_VIDEO_BYTES:
                 raise RuntimeError(
@@ -780,9 +872,11 @@ async def wait_for_download_url(job_id: str):
 # DOWNLOAD FILE FROM NOVASTACK
 # =========================================================
 
-async def save_download(download_url: str, destination: str):
-    """Stream a NovaStack file to disk with a size limit."""
-
+async def save_download(
+    download_url: str,
+    destination: str,
+    max_bytes: int = MAX_VIDEO_BYTES
+):
     url = urljoin(
         f"{NOVASTACK_BASE_URL}/",
         download_url
@@ -790,7 +884,9 @@ async def save_download(download_url: str, destination: str):
 
     headers = {}
 
-    hostname = (urlparse(url).hostname or "").lower()
+    hostname = (
+        urlparse(url).hostname or ""
+    ).lower()
 
     if hostname == "api-novastack.vercel.app":
         headers["x-api-key"] = NOVASTACK_API_KEY
@@ -818,74 +914,132 @@ async def save_download(download_url: str, destination: str):
                 )
 
             with open(destination, "wb") as out_file:
-
                 async for chunk in upstream.aiter_bytes():
                     written += len(chunk)
 
-                    if written > MAX_VIDEO_BYTES:
+                    if written > max_bytes:
                         raise RuntimeError(
-                            "Downloaded file exceeds the 50 MB limit"
+                            "Downloaded file exceeds the size limit"
                         )
 
                     out_file.write(chunk)
 
     if written <= 0:
-        raise RuntimeError(
-            "Downloaded file is empty"
-        )
+        raise RuntimeError("Downloaded file is empty")
+
+    return written
 
 
 # =========================================================
-# CREATE DOWNLOAD JOB
+# LOCAL FFMPEG + FFPROBE CONVERSION
 # =========================================================
 
-async def create_youtube_job(endpoint: str, watch_url: str):
-    """Create a NovaStack video or audio download job."""
+async def convert_video_to_mp3(
+    video_path: str,
+    audio_path: str
+):
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
 
-    payload = unwrap(
-        await novastack_json(
-            endpoint,
-            {"url": watch_url}
+    if not ffmpeg or not ffprobe:
+        raise RuntimeError(
+            "FFmpeg or FFprobe is not installed on the Render server"
         )
+
+    # Verify duration before conversion.
+    probe = await asyncio.create_subprocess_exec(
+        ffprobe,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
 
-    if not isinstance(payload, dict):
-        raise RuntimeError(
-            "NovaStack returned an invalid download job response"
+    stdout, stderr = await probe.communicate()
+
+    if probe.returncode != 0:
+        logger.error(
+            "FFprobe failed: %s",
+            stderr.decode(errors="replace")[-1500:]
         )
 
-    job_id = (
-        payload.get("job_id")
-        or payload.get("id")
+        raise RuntimeError(
+            "FFprobe could not inspect the downloaded video"
+        )
+
+    try:
+        duration = float(stdout.decode().strip())
+    except (ValueError, TypeError):
+        raise RuntimeError(
+            "Could not determine video duration"
+        )
+
+    if duration > MAX_VIDEO_DURATION:
+        raise RuntimeError(
+            "Video exceeds the 15 minute limit"
+        )
+
+    # Extract and encode MP3.
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", video_path,
+        "-vn",
+        "-map_metadata", "-1",
+        "-codec:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-ac", "2",
+        audio_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
 
-    if not job_id:
+    try:
+        _, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=180
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
         raise RuntimeError(
-            "NovaStack did not return a Job ID"
+            "FFmpeg conversion timed out"
         )
 
-    return str(job_id)
-
-
-async def check_video_duration(watch_url: str):
-    """Reject videos longer than the configured limit."""
-
-    info = unwrap(
-        await novastack_json(
-            "/v1/youtube/metadata",
-            {"url": watch_url}
+    if process.returncode != 0:
+        logger.error(
+            "FFmpeg conversion failed: %s",
+            stderr.decode(errors="replace")[-1500:]
         )
+
+        raise RuntimeError(
+            "MP3 conversion failed"
+        )
+
+    if (
+        not os.path.exists(audio_path)
+        or os.path.getsize(audio_path) == 0
+    ):
+        raise RuntimeError(
+            "Generated MP3 is empty"
+        )
+
+    audio_size = os.path.getsize(audio_path)
+
+    if audio_size > MAX_VIDEO_BYTES:
+        raise RuntimeError(
+            "Generated MP3 exceeds the 50 MB limit"
+        )
+
+    logger.info(
+        "MP3 conversion successful: %s bytes",
+        audio_size
     )
-
-    if not isinstance(info, dict):
-        return
-
-    duration = info.get("duration")
-
-    if duration and int(duration) > MAX_VIDEO_DURATION:
-        raise RuntimeError(
-            "Video is longer than the 15 minute limit"
-        )
 
 
 # =========================================================
@@ -957,7 +1111,7 @@ async def youtube_download(
 
 
 # =========================================================
-# YOUTUBE AUDIO DOWNLOAD
+# YOUTUBE AUDIO DOWNLOAD - LOCAL MP3 CONVERSION
 # =========================================================
 
 @app.get("/youtube/audio")
@@ -974,27 +1128,48 @@ async def youtube_audio(
     )
 
     try:
+        # Check metadata and duration.
         await check_video_duration(watch_url)
 
+        # Use NovaStack VIDEO endpoint.
+        # Do not call NovaStack's audio endpoint.
         job_id = await create_youtube_job(
-            "/v1/youtube/audio",
+            "/v1/youtube/video",
             watch_url
         )
 
+        logger.info(
+            "Created NovaStack video job for MP3 extraction: %s",
+            job_id
+        )
+
+        # Wait until the MP4 is ready.
         download_url = await wait_for_download_url(job_id)
 
-        media_path = os.path.join(
+        video_path = os.path.join(
+            temp_dir,
+            "source.mp4"
+        )
+
+        audio_path = os.path.join(
             temp_dir,
             f"{video_id}.mp3"
         )
 
+        # Download the MP4.
         await save_download(
             download_url,
-            media_path
+            video_path
+        )
+
+        # Convert locally using Render's FFmpeg.
+        await convert_video_to_mp3(
+            video_path,
+            audio_path
         )
 
         return FileResponse(
-            media_path,
+            audio_path,
             media_type="audio/mpeg",
             filename=f"{video_id}.mp3",
             background=BackgroundTask(
@@ -1013,7 +1188,9 @@ async def youtube_audio(
         if isinstance(exc, HTTPException):
             raise
 
-        logger.exception("YouTube audio download failed")
+        logger.exception(
+            "YouTube audio download/conversion failed"
+        )
 
         raise HTTPException(
             status_code=502,

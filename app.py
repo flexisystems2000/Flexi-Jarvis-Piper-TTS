@@ -9,8 +9,10 @@ import tempfile
 import re
 
 from pathlib import Path
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response, FileResponse
+import httpx
+from urllib.parse import quote
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from piper import PiperVoice
@@ -21,6 +23,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jarvis-media")
 
 API_KEY = os.environ.get("PIPER_API_KEY", "")
+NOVASTACK_BASE_URL = os.environ.get("NOVASTACK_BASE_URL", "https://app-novastack.vercel.app").rstrip("/")
+NOVASTACK_API_KEY = os.environ.get("NOVASTACK_API_KEY", "")
+NOVASTACK_TIMEOUT = float(os.environ.get("NOVASTACK_TIMEOUT", "90"))
 VOICE_PATH = Path("/app/voices/en_US-lessac-low.onnx")
 MAX_VIDEO_BYTES = 50 * 1024 * 1024
 MAX_VIDEO_DURATION = 15 * 60
@@ -62,6 +67,11 @@ def home():
             "youtube_search": "GET /youtube/search?q=JAMB",
             "youtube_video": "GET /youtube/video/VIDEO_ID",
             "youtube_download": "GET /youtube/download/VIDEO_ID",
+            "novastack_voice_models": "GET /novastack/voice/models",
+            "novastack_model_voices": "GET /novastack/voices/MODEL_ID",
+            "novastack_voice_model": "GET /novastack/voice/model",
+            "novastack_generate_voice": "POST /novastack/voice/MODEL_ID",
+            "novastack_voice_job": "GET /novastack/voice/jobs/JOB_ID",
             "health": "GET /health"
         },
         "audio_format": "ogg-opus"
@@ -74,7 +84,9 @@ def health():
         "status": "ok",
         "voice_loaded": voice is not None,
         "ffmpeg_available": shutil.which("ffmpeg") is not None,
-        "youtube_extractor_available": True
+        "youtube_extractor_available": True,
+        "novastack_configured": bool(NOVASTACK_API_KEY),
+        "novastack_base_url": NOVASTACK_BASE_URL if NOVASTACK_API_KEY else None
     }
 
 
@@ -144,6 +156,135 @@ def generate_audio(body: TTSRequest, x_api_key: str = Header(default="")):
     except Exception:
         logger.exception("Speech generation failed")
         raise HTTPException(status_code=500, detail="Speech generation failed")
+
+
+
+# NovaStack voice API connector.
+# The local PIPER_API_KEY protects Jarvis -> this service.
+# NOVASTACK_API_KEY is used only for this service -> NovaStack.
+def require_novastack_config():
+    if not NOVASTACK_API_KEY:
+        raise HTTPException(status_code=503, detail="NOVASTACK_API_KEY is not configured")
+
+
+async def novastack_request(
+    method: str,
+    upstream_path: str,
+    *,
+    params=None,
+    body: bytes = None,
+    content_type: str = None
+):
+    require_novastack_config()
+    headers = {"x-api-key": NOVASTACK_API_KEY}
+    if content_type:
+        headers["content-type"] = content_type
+
+    url = f"{NOVASTACK_BASE_URL}{upstream_path}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(NOVASTACK_TIMEOUT, connect=20.0),
+            follow_redirects=True
+        ) as client:
+            upstream = await client.request(
+                method,
+                url,
+                params=params,
+                content=body,
+                headers=headers
+            )
+
+        response_headers = {}
+        for key in ("content-disposition", "cache-control"):
+            if key in upstream.headers:
+                response_headers[key] = upstream.headers[key]
+
+        media_type = upstream.headers.get("content-type", "application/json")
+        logger.info(
+            "NovaStack %s %s -> HTTP %s (%s bytes)",
+            method, upstream_path, upstream.status_code, len(upstream.content)
+        )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=media_type.split(";")[0],
+            headers=response_headers
+        )
+    except httpx.TimeoutException:
+        logger.exception("NovaStack request timed out: %s", upstream_path)
+        raise HTTPException(status_code=504, detail="NovaStack request timed out")
+    except httpx.HTTPError:
+        logger.exception("NovaStack connection failed: %s", upstream_path)
+        raise HTTPException(status_code=502, detail="Could not connect to NovaStack")
+
+
+@app.get("/novastack/voice/models")
+async def novastack_voice_models(
+    request: Request,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+    return await novastack_request(
+        "GET", "/v1/voice/models", params=dict(request.query_params)
+    )
+
+
+@app.get("/novastack/voices/{model_id}")
+async def novastack_model_voices(
+    model_id: str,
+    request: Request,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+    return await novastack_request(
+        "GET",
+        f"/v1/voices/{quote(model_id, safe='')}",
+        params=dict(request.query_params)
+    )
+
+
+@app.get("/novastack/voice/model")
+async def novastack_voice_model(
+    request: Request,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+    return await novastack_request(
+        "GET", "/v1/voice/model", params=dict(request.query_params)
+    )
+
+
+@app.post("/novastack/voice/{model_id}")
+async def novastack_generate_voice(
+    model_id: str,
+    request: Request,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+    body = await request.body()
+    content_type = request.headers.get("content-type", "application/json")
+    if not body:
+        raise HTTPException(status_code=400, detail="Voice generation request body is required")
+    return await novastack_request(
+        "POST",
+        f"/v1/voice/{quote(model_id, safe='')}",
+        body=body,
+        content_type=content_type
+    )
+
+
+@app.get("/novastack/voice/jobs/{job_id}")
+async def novastack_voice_job(
+    job_id: str,
+    request: Request,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+    return await novastack_request(
+        "GET",
+        f"/v1/voice/jobs/{quote(job_id, safe='')}",
+        params=dict(request.query_params)
+    )
 
 
 def youtube_options(extra=None):

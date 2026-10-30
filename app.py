@@ -7,29 +7,32 @@ import logging
 import subprocess
 import tempfile
 import re
+import asyncio
 
 from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response, FileResponse
 import httpx
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse, parse_qs
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from piper import PiperVoice
-import yt_dlp
 
 app = FastAPI(title="Jarvis Piper TTS + YouTube")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jarvis-media")
 
 API_KEY = os.environ.get("PIPER_API_KEY", "")
-NOVASTACK_BASE_URL = os.environ.get("NOVASTACK_BASE_URL", "https://app-novastack.vercel.app").rstrip("/")
-NOVASTACK_API_KEY = os.environ.get("NOVASTACK_API_KEY", "")
+NOVASTACK_BASE_URL = os.environ.get("NOVASTACK_BASE_URL", "https://api-novastack.vercel.app").rstrip("/")
+NOVASTACK_API_KEY = os.environ.get("NOVASTACK_KEY", "")
 NOVASTACK_TIMEOUT = float(os.environ.get("NOVASTACK_TIMEOUT", "90"))
 VOICE_PATH = Path("/app/voices/en_US-lessac-low.onnx")
 MAX_VIDEO_BYTES = 50 * 1024 * 1024
 MAX_VIDEO_DURATION = 15 * 60
+DOWNLOAD_POLL_INTERVAL = 2
+DOWNLOAD_POLL_TIMEOUT = 120
 YOUTUBE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 voice = None
 
 
@@ -65,8 +68,8 @@ def home():
         "endpoints": {
             "tts": "POST /tts",
             "youtube_search": "GET /youtube/search?q=JAMB",
-            "youtube_video": "GET /youtube/video/VIDEO_ID",
-            "youtube_download": "GET /youtube/download/VIDEO_ID",
+            "youtube_video": "GET /youtube/video?url=VIDEO_URL",
+            "youtube_download": "GET /youtube/download?url=VIDEO_URL",
             "novastack_voice_models": "GET /novastack/voice/models",
             "novastack_model_voices": "GET /novastack/voices/MODEL_ID",
             "novastack_voice_model": "GET /novastack/voice/model",
@@ -89,8 +92,6 @@ def health():
         "novastack_base_url": NOVASTACK_BASE_URL if NOVASTACK_API_KEY else None
     }
 
-
-# Existing Piper TTS implementation preserved.
 @app.post("/tts")
 def generate_audio(body: TTSRequest, x_api_key: str = Header(default="")):
     require_api_key(x_api_key)
@@ -159,12 +160,9 @@ def generate_audio(body: TTSRequest, x_api_key: str = Header(default="")):
 
 
 
-# NovaStack voice API connector.
-# The local PIPER_API_KEY protects Jarvis -> this service.
-# NOVASTACK_API_KEY is used only for this service -> NovaStack.
 def require_novastack_config():
     if not NOVASTACK_API_KEY:
-        raise HTTPException(status_code=503, detail="NOVASTACK_API_KEY is not configured")
+        raise HTTPException(status_code=503, detail="NOVASTACK_KEY is not configured")
 
 
 async def novastack_request(
@@ -287,35 +285,85 @@ async def novastack_voice_job(
     )
 
 
-def youtube_options(extra=None):
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 20,
-        "retries": 1,
-        "extractor_retries": 1,
-        "logger": logger
-    }
-    if extra:
-        options.update(extra)
-    return options
+async def novastack_json(path: str, params=None):
+    """GET a NovaStack route and return the parsed JSON body."""
+    require_novastack_config()
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(NOVASTACK_TIMEOUT, connect=20.0),
+        follow_redirects=True
+    ) as client:
+        upstream = await client.get(
+            f"{NOVASTACK_BASE_URL}{path}",
+            params=params,
+            headers={"x-api-key": NOVASTACK_API_KEY}
+        )
+
+    logger.info("NovaStack GET %s -> HTTP %s", path, upstream.status_code)
+    if upstream.status_code >= 400:
+        raise RuntimeError(f"NovaStack returned HTTP {upstream.status_code}")
+    return upstream.json()
 
 
-def validate_video_id(video_id: str):
-    if not YOUTUBE_ID_PATTERN.fullmatch(video_id):
-        raise HTTPException(status_code=400, detail="Invalid YouTube video ID")
+def unwrap(payload):
+    if isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list)):
+        return payload["data"]
+    return payload
 
 
-def safe_video_data(info):
-    video_id = info.get("id")
+def extract_list(payload):
+    payload = unwrap(payload)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("results", "videos", "items"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+    return []
+
+
+def format_duration(seconds):
+    if not seconds:
+        return None
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def parse_youtube_url(raw_url: str):
+    """Return (video_id, clean_watch_url) for any common YouTube link style."""
+    parsed = urlparse(raw_url.strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or host not in YOUTUBE_HOSTS:
+        raise HTTPException(status_code=400, detail="Invalid YouTube video URL")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    video_id = None
+    if host == "youtu.be":
+        video_id = parts[0] if parts else None
+    elif parts and parts[0] == "watch":
+        video_id = parse_qs(parsed.query).get("v", [None])[0]
+    elif len(parts) > 1 and parts[0] in ("shorts", "embed", "live"):
+        video_id = parts[1]
+
+    if not video_id or not YOUTUBE_ID_PATTERN.fullmatch(video_id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video URL")
+
+    return video_id, f"https://www.youtube.com/watch?v={video_id}"
+
+
+def safe_video_data(info, fallback_id=None):
+    # The metadata endpoint doesn't echo the video ID back, so we pass ours in
+    video_id = info.get("id") or info.get("video_id") or fallback_id
+    duration = info.get("duration")
     return {
         "id": video_id,
         "title": info.get("title"),
-        "channel": info.get("channel") or info.get("uploader"),
+        "channel": info.get("channel") or info.get("uploader") or info.get("author"),
         "channel_url": info.get("channel_url") or info.get("uploader_url"),
-        "duration_seconds": info.get("duration"),
-        "duration": info.get("duration_string"),
+        "duration_seconds": duration,
+        "duration": info.get("duration_string") or format_duration(duration),
         "view_count": info.get("view_count"),
         "upload_date": info.get("upload_date"),
         "description": (info.get("description") or "")[:1500],
@@ -325,50 +373,49 @@ def safe_video_data(info):
 
 
 @app.get("/youtube/search")
-def youtube_search(
+async def youtube_search(
     q: str = Query(min_length=2, max_length=150),
     limit: int = Query(default=5, ge=1, le=10),
     x_api_key: str = Header(default="")
 ):
     require_api_key(x_api_key)
     try:
-        with yt_dlp.YoutubeDL(youtube_options({
-            "extract_flat": "in_playlist",
-            "skip_download": True
-        })) as ydl:
-            result = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+        payload = await novastack_json("/v1/youtube/search", {"q": q, "limit": limit})
 
         videos = []
-        for item in (result or {}).get("entries", []):
+        for item in extract_list(payload)[:limit]:
             if not item:
                 continue
-            video_id = item.get("id")
+            video_id = item.get("id") or item.get("video_id")
             videos.append({
                 "id": video_id,
                 "title": item.get("title"),
-                "channel": item.get("channel") or item.get("uploader"),
+                "channel": item.get("channel") or item.get("uploader") or item.get("author"),
                 "duration": item.get("duration"),
                 "thumbnail": item.get("thumbnail"),
                 "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else item.get("url")
             })
 
         return {"success": True, "query": q, "count": len(videos), "results": videos}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("YouTube search failed")
         raise HTTPException(status_code=502, detail=f"YouTube search failed: {str(exc)[:300]}")
 
 
-@app.get("/youtube/video/{video_id}")
-def youtube_video_info(video_id: str, x_api_key: str = Header(default="")):
+@app.get("/youtube/video")
+async def youtube_video_info(
+    url: str = Query(min_length=11, max_length=300),
+    x_api_key: str = Header(default="")
+):
     require_api_key(x_api_key)
-    validate_video_id(video_id)
+    video_id, watch_url = parse_youtube_url(url)
     try:
-        with yt_dlp.YoutubeDL(youtube_options({"skip_download": True})) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}",
-                download=False
-            )
-        return {"success": True, "video": safe_video_data(info)}
+        payload = await novastack_json("/v1/youtube/metadata", {"url": watch_url})
+        return {"success": True, "video": safe_video_data(unwrap(payload), video_id)}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("YouTube video information lookup failed")
         raise HTTPException(
@@ -377,56 +424,91 @@ def youtube_video_info(video_id: str, x_api_key: str = Header(default="")):
         )
 
 
-@app.get("/youtube/download/{video_id}")
-def youtube_download(video_id: str, x_api_key: str = Header(default="")):
+async def wait_for_download_url(job_id: str):
+    """Poll the NovaStack job until the file is ready, then return its URL."""
+    waited = 0
+    while waited < DOWNLOAD_POLL_TIMEOUT:
+        job = unwrap(await novastack_json(f"/v1/youtube/jobs/{quote(str(job_id), safe='')}"))
+        status = str(job.get("status", "")).lower()
+
+        if status == "done":
+            size = int(job.get("file_size_bytes") or 0)
+            if size > MAX_VIDEO_BYTES:
+                raise RuntimeError("Downloaded video exceeds the 50 MB limit")
+            if not job.get("download_url"):
+                raise RuntimeError("NovaStack finished the job without a download link")
+            return job["download_url"]
+        if status == "failed":
+            raise RuntimeError("NovaStack could not download this video")
+
+        await asyncio.sleep(DOWNLOAD_POLL_INTERVAL)
+        waited += DOWNLOAD_POLL_INTERVAL
+
+    raise RuntimeError("Timed out waiting for NovaStack to prepare the video")
+
+
+async def save_download(download_url: str, destination: str):
+    """Stream the finished file to disk, bailing out if it gets too big."""
+    url = urljoin(f"{NOVASTACK_BASE_URL}/", download_url)
+
+    headers = {}
+    if (urlparse(url).hostname or "").endswith("novastack.vercel.app"):
+        headers["x-api-key"] = NOVASTACK_API_KEY
+
+    written = 0
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(NOVASTACK_TIMEOUT, connect=20.0),
+        follow_redirects=True
+    ) as client:
+        async with client.stream("GET", url, headers=headers) as upstream:
+            if upstream.status_code >= 400:
+                raise RuntimeError(f"NovaStack file download returned HTTP {upstream.status_code}")
+            with open(destination, "wb") as out_file:
+                async for chunk in upstream.aiter_bytes():
+                    written += len(chunk)
+                    if written > MAX_VIDEO_BYTES:
+                        raise RuntimeError("Downloaded video exceeds the 50 MB limit")
+                    out_file.write(chunk)
+
+    if written <= 0:
+        raise RuntimeError("Downloaded video is empty")
+
+
+@app.get("/youtube/download")
+async def youtube_download(
+    url: str = Query(min_length=11, max_length=300),
+    x_api_key: str = Header(default="")
+):
     require_api_key(x_api_key)
-    validate_video_id(video_id)
+    video_id, watch_url = parse_youtube_url(url)
     temp_dir = tempfile.mkdtemp(prefix="jarvis-youtube-")
 
     try:
-        output_template = os.path.join(temp_dir, "video.%(ext)s")
-        options = youtube_options({
-            "format": "best[ext=mp4][filesize<50M]/best[filesize<50M]/best",
-            "outtmpl": output_template,
-            "merge_output_format": "mp4",
-            "max_filesize": MAX_VIDEO_BYTES,
-            "overwrites": True,
-            "match_filter": yt_dlp.utils.match_filter_func(
-                f"duration > {MAX_VIDEO_DURATION}"
-            )
-        })
+        info = unwrap(await novastack_json("/v1/youtube/metadata", {"url": watch_url}))
+        duration = info.get("duration")
+        if duration and duration > MAX_VIDEO_DURATION:
+            raise RuntimeError("Video is longer than the 15 minute limit")
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}",
-                download=True
-            )
+        job = unwrap(await novastack_json("/v1/youtube/video", {"url": watch_url}))
+        job_id = job.get("job_id") or job.get("id")
+        if not job_id:
+            raise RuntimeError("NovaStack did not return a job ID")
 
-        files = [
-            os.path.join(temp_dir, name)
-            for name in os.listdir(temp_dir)
-            if os.path.isfile(os.path.join(temp_dir, name))
-        ]
-        if not files:
-            raise RuntimeError("yt-dlp did not produce a media file")
+        download_url = await wait_for_download_url(job_id)
+        media_path = os.path.join(temp_dir, "video.mp4")
+        await save_download(download_url, media_path)
 
-        media_path = max(files, key=os.path.getsize)
-        media_size = os.path.getsize(media_path)
-        if media_size > MAX_VIDEO_BYTES:
-            raise RuntimeError("Downloaded video exceeds the 50 MB limit")
-        if media_size <= 0:
-            raise RuntimeError("Downloaded video is empty")
-
-        media_type = "video/mp4" if media_path.lower().endswith(".mp4") else "application/octet-stream"
         return FileResponse(
             media_path,
-            media_type=media_type,
+            media_type="video/mp4",
             filename=f"{video_id}.mp4",
             background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True)
         )
 
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        if isinstance(exc, HTTPException):
+            raise
         logger.exception("YouTube download failed")
         raise HTTPException(
             status_code=502,

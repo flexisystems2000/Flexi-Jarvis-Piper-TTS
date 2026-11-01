@@ -561,6 +561,12 @@ async def magic_hour_request(method: str, endpoint: str, body: bytes = None):
             endpoint,
             upstream.status_code
         )
+        if upstream.is_error:
+            logger.error(
+                "Magic Hour upstream error %s: %s",
+                upstream.status_code,
+                upstream.text[:4000]
+            )
 
         response_type = upstream.headers.get(
             "content-type",
@@ -617,11 +623,38 @@ async def magic_hour_generate_video(
             detail="A non-empty 'prompt' field is required"
         )
 
-    # Magic Hour generation is asynchronous; pass its job response back to Jarvis.
+    # Magic Hour requires a structured Text-to-Video payload. Jarvis may send
+    # only {"prompt": "..."}; expand that into the documented API schema.
+    # Explicit supported options supplied by Jarvis may override these defaults.
+    magic_hour_payload = {
+        "name": str(payload.get("name") or "Jarvis AI Video")[:120],
+        "end_seconds": payload.get("end_seconds", 5),
+        "aspect_ratio": payload.get("aspect_ratio", "16:9"),
+        "resolution": payload.get("resolution", "720p"),
+        "model": payload.get("model", "kling-3.0"),
+        "audio": payload.get("audio", True),
+        "style": {"prompt": prompt.strip()},
+    }
+
+    # Validate the common inputs locally so malformed requests fail clearly.
+    try:
+        magic_hour_payload["end_seconds"] = float(magic_hour_payload["end_seconds"])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="end_seconds must be a number")
+    if magic_hour_payload["end_seconds"] <= 0:
+        raise HTTPException(status_code=400, detail="end_seconds must be greater than zero")
+    if magic_hour_payload["aspect_ratio"] not in {"16:9", "9:16", "1:1"}:
+        raise HTTPException(status_code=400, detail="aspect_ratio must be 16:9, 9:16, or 1:1")
+    if magic_hour_payload["resolution"] not in {"480p", "720p", "1080p"}:
+        raise HTTPException(status_code=400, detail="resolution must be 480p, 720p, or 1080p")
+    if not isinstance(magic_hour_payload["model"], str) or not magic_hour_payload["model"].strip():
+        raise HTTPException(status_code=400, detail="model must be a non-empty string")
+
+    import json
     return await magic_hour_request(
         "POST",
         "/v1/text-to-video",
-        body=body
+        body=json.dumps(magic_hour_payload).encode("utf-8")
     )
 
 

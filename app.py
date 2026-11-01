@@ -43,7 +43,15 @@ MAGIC_HOUR_BASE_URL = os.environ.get(
     "https://api.magichour.ai"
 ).rstrip("/")
 
-MAGIC_HOUR_API_KEY = os.environ.get("MAGIC_HOUR_API_KEY", "")
+# Comma/newline-separated authorised keys. Single-key variable remains supported.
+MAGIC_HOUR_API_KEYS = [
+    key.strip() for key in re.split(
+        r"[,\n]", os.environ.get("MAGIC_HOUR_API_KEYS", "")
+    ) if key.strip()
+]
+if not MAGIC_HOUR_API_KEYS and os.environ.get("MAGIC_HOUR_API_KEY", "").strip():
+    MAGIC_HOUR_API_KEYS = [os.environ["MAGIC_HOUR_API_KEY"].strip()]
+MAGIC_HOUR_API_KEY = MAGIC_HOUR_API_KEYS[0] if MAGIC_HOUR_API_KEYS else ""
 MAGIC_HOUR_TIMEOUT = float(
     os.environ.get("MAGIC_HOUR_TIMEOUT", "180")
 )
@@ -532,60 +540,52 @@ async def novastack_json(path: str, params=None):
 # =========================================================
 
 async def magic_hour_request(method: str, endpoint: str, body: bytes = None):
+    """Try each configured authorised key in order until one request succeeds.
+
+    Any upstream HTTP error (including 400/401/402/403/429/5xx), timeout, or
+    connection failure advances to the next configured key. The final key's
+    response is returned if every key receives an HTTP error.
+    """
     require_magic_hour_config()
-
-    headers = {
-        "Authorization": f"Bearer {MAGIC_HOUR_API_KEY}",
-        "Accept": "application/json"
-    }
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-
     url = f"{MAGIC_HOUR_BASE_URL}{endpoint}"
+    last_error = None
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(MAGIC_HOUR_TIMEOUT, connect=20.0),
-            follow_redirects=True
-        ) as client:
-            upstream = await client.request(
-                method,
-                url,
-                content=body,
-                headers=headers
-            )
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(MAGIC_HOUR_TIMEOUT, connect=20.0),
+        follow_redirects=True
+    ) as client:
+        for index, api_key in enumerate(MAGIC_HOUR_API_KEYS, start=1):
+            headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            try:
+                upstream = await client.request(method, url, content=body, headers=headers)
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                logger.warning("Magic Hour key %s/%s timed out; trying next configured key", index, len(MAGIC_HOUR_API_KEYS))
+                continue
+            except httpx.HTTPError as exc:
+                last_error = exc
+                logger.warning("Magic Hour key %s/%s connection error; trying next configured key", index, len(MAGIC_HOUR_API_KEYS))
+                continue
 
-        logger.info(
-            "Magic Hour %s %s -> HTTP %s",
-            method,
-            endpoint,
-            upstream.status_code
-        )
-        if upstream.is_error:
-            logger.error(
-                "Magic Hour upstream error %s: %s",
-                upstream.status_code,
-                upstream.text[:4000]
-            )
+            logger.info("Magic Hour %s %s -> HTTP %s (key slot %s/%s)", method, endpoint, upstream.status_code, index, len(MAGIC_HOUR_API_KEYS))
+            if upstream.is_error and index < len(MAGIC_HOUR_API_KEYS):
+                logger.warning(
+                    "Magic Hour key slot %s/%s returned HTTP %s; trying next configured key",
+                    index, len(MAGIC_HOUR_API_KEYS), upstream.status_code
+                )
+                continue
+            if upstream.is_error:
+                logger.error("All Magic Hour keys returned errors; final HTTP %s: %s", upstream.status_code, upstream.text[:4000])
+            response_type = upstream.headers.get("content-type", "application/json").split(";")[0]
+            return Response(content=upstream.content, status_code=upstream.status_code, media_type=response_type)
 
-        response_type = upstream.headers.get(
-            "content-type",
-            "application/json"
-        ).split(";")[0]
-
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            media_type=response_type
-        )
-
-    except httpx.TimeoutException:
-        logger.exception("Magic Hour request timed out: %s", endpoint)
-        raise HTTPException(status_code=504, detail="Magic Hour request timed out")
-
-    except httpx.HTTPError:
-        logger.exception("Magic Hour connection failed: %s", endpoint)
-        raise HTTPException(status_code=502, detail="Could not connect to Magic Hour")
+    if isinstance(last_error, httpx.TimeoutException):
+        raise HTTPException(status_code=504, detail="All configured Magic Hour keys timed out")
+    if last_error is not None:
+        raise HTTPException(status_code=502, detail="All configured Magic Hour keys failed to connect")
+    raise HTTPException(status_code=502, detail="All configured Magic Hour keys failed")
 
 
 @app.post("/video/generate")

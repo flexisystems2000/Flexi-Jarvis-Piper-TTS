@@ -37,6 +37,16 @@ NOVASTACK_BASE_URL = os.environ.get(
 ).rstrip("/")
 
 NOVASTACK_API_KEY = os.environ.get("NOVASTACK_KEY", "")
+
+MAGIC_HOUR_BASE_URL = os.environ.get(
+    "MAGIC_HOUR_BASE_URL",
+    "https://api.magichour.ai"
+).rstrip("/")
+
+MAGIC_HOUR_API_KEY = os.environ.get("MAGIC_HOUR_API_KEY", "")
+MAGIC_HOUR_TIMEOUT = float(
+    os.environ.get("MAGIC_HOUR_TIMEOUT", "180")
+)
 NOVASTACK_TIMEOUT = float(
     os.environ.get("NOVASTACK_TIMEOUT", "90")
 )
@@ -88,6 +98,14 @@ def require_novastack_config():
         )
 
 
+def require_magic_hour_config():
+    if not MAGIC_HOUR_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="MAGIC_HOUR_API_KEY is not configured"
+        )
+
+
 # =========================================================
 # PIPER VOICE
 # =========================================================
@@ -134,6 +152,8 @@ def home():
             "novastack_voice_model": "GET /novastack/voice/model",
             "novastack_generate_voice": "POST /novastack/voice/MODEL_ID",
             "novastack_voice_job": "GET /novastack/voice/jobs/JOB_ID",
+            "magic_hour_generate_video": "POST /video/generate",
+            "magic_hour_video_status": "GET /video/jobs/PROJECT_ID",
             "health": "GET /health"
         },
         "audio_format": "ogg-opus",
@@ -156,7 +176,8 @@ def health():
         "novastack_configured": bool(NOVASTACK_API_KEY),
         "novastack_base_url": (
             NOVASTACK_BASE_URL if NOVASTACK_API_KEY else None
-        )
+        ),
+        "magic_hour_configured": bool(MAGIC_HOUR_API_KEY)
     }
 
 
@@ -504,6 +525,120 @@ async def novastack_json(path: str, params=None):
         raise RuntimeError(
             f"NovaStack returned invalid JSON for {path}"
         )
+
+
+# =========================================================
+# MAGIC HOUR TEXT-TO-VIDEO
+# =========================================================
+
+async def magic_hour_request(method: str, endpoint: str, body: bytes = None):
+    require_magic_hour_config()
+
+    headers = {
+        "Authorization": f"Bearer {MAGIC_HOUR_API_KEY}",
+        "Accept": "application/json"
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    url = f"{MAGIC_HOUR_BASE_URL}{endpoint}"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(MAGIC_HOUR_TIMEOUT, connect=20.0),
+            follow_redirects=True
+        ) as client:
+            upstream = await client.request(
+                method,
+                url,
+                content=body,
+                headers=headers
+            )
+
+        logger.info(
+            "Magic Hour %s %s -> HTTP %s",
+            method,
+            endpoint,
+            upstream.status_code
+        )
+
+        response_type = upstream.headers.get(
+            "content-type",
+            "application/json"
+        ).split(";")[0]
+
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=response_type
+        )
+
+    except httpx.TimeoutException:
+        logger.exception("Magic Hour request timed out: %s", endpoint)
+        raise HTTPException(status_code=504, detail="Magic Hour request timed out")
+
+    except httpx.HTTPError:
+        logger.exception("Magic Hour connection failed: %s", endpoint)
+        raise HTTPException(status_code=502, detail="Could not connect to Magic Hour")
+
+
+@app.post("/video/generate")
+async def magic_hour_generate_video(
+    request: Request,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(
+            status_code=400,
+            detail="Video generation JSON body is required"
+        )
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must contain valid JSON"
+        )
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must be a JSON object"
+        )
+
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="A non-empty 'prompt' field is required"
+        )
+
+    # Magic Hour generation is asynchronous; pass its job response back to Jarvis.
+    return await magic_hour_request(
+        "POST",
+        "/v1/text-to-video",
+        body=body
+    )
+
+
+@app.get("/video/jobs/{project_id}")
+async def magic_hour_video_status(
+    project_id: str,
+    x_api_key: str = Header(default="")
+):
+    require_api_key(x_api_key)
+
+    if not project_id.strip():
+        raise HTTPException(status_code=400, detail="Project ID is required")
+
+    return await magic_hour_request(
+        "GET",
+        f"/v1/video-projects/{quote(project_id, safe='')}"
+    )
 
 
 # =========================================================

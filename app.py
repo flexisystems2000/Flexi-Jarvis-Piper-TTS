@@ -628,10 +628,10 @@ async def magic_hour_generate_video(
     # Explicit supported options supplied by Jarvis may override these defaults.
     magic_hour_payload = {
         "name": str(payload.get("name") or "Jarvis AI Video")[:120],
-        "end_seconds": payload.get("end_seconds", 5),
+        "end_seconds": payload.get("end_seconds", 10),
         "aspect_ratio": payload.get("aspect_ratio", "16:9"),
-        "resolution": payload.get("resolution", "720p"),
-        "model": payload.get("model", "kling-3.0"),
+        "resolution": payload.get("resolution", "480p"),
+        "model": payload.get("model", "ltx-2.5"),
         "audio": payload.get("audio", True),
         "style": {"prompt": prompt.strip()},
     }

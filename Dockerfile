@@ -23,7 +23,7 @@ RUN python -m piper.download_voices \
     --download-dir /app/voices \
     en_US-lessac-low
 
-COPY app.py .
+COPY app.py piper_pdf_router.py ./
 
 EXPOSE 10000
 

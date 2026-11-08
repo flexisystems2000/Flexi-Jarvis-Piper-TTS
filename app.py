@@ -18,6 +18,7 @@ from urllib.parse import quote, urljoin, urlparse, parse_qs
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from piper import PiperVoice
+from piper_pdf_router import router as pdf_router
 
 
 # =========================================================
@@ -25,6 +26,7 @@ from piper import PiperVoice
 # =========================================================
 
 app = FastAPI(title="Jarvis Piper TTS + YouTube")
+app.include_router(pdf_router)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jarvis-media")

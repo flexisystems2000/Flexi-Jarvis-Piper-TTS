@@ -24,6 +24,6 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install file-generation dependencies
-        run: python -m pip install fastapi pydantic reportlab PyMuPDF python-docx openpyxl python-pptx
+        run: python -m pip install fastapi pydantic reportlab PyMuPDF python-docx openpyxl python-pptx PyYAML
       - name: Run file-generation tests
         run: python -m unittest -v test_file_generator.py

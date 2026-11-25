@@ -82,6 +82,16 @@ class GeneralFileGeneratorTests(unittest.TestCase):
             generate_general_file(payload, 'wrong-key')
         self.assertEqual(_safe_general_name('../../Quarterly Report.xlsx'), 'Quarterly_Report.xlsx')
 
+    def test_xml_yaml_toml_and_python_source_are_syntax_checked(self):
+        with self.assertRaises(HTTPException):
+            _make_general_file(GeneralFileRequest(filename='bad.xml', content='<root>'), 'xml')
+        with self.assertRaises(HTTPException):
+            _make_general_file(GeneralFileRequest(filename='bad.yaml', content='key: [unterminated'), 'yaml')
+        with self.assertRaises(HTTPException):
+            _make_general_file(GeneralFileRequest(filename='bad.toml', content='key = ['), 'toml')
+        with self.assertRaises(HTTPException):
+            _make_general_file(GeneralFileRequest(filename='bad.py', content='def broken('), 'py')
+        self.assertTrue(_make_general_file(GeneralFileRequest(filename='ok.py', content='print(1)'), 'py'))
 
 if __name__ == '__main__':
     unittest.main()

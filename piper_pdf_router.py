@@ -1,4 +1,4 @@
-"""Authenticated ReportLab PDF routes for the existing Piper/FastAPI service.
+"""Authenticated PDF extraction and multi-format file generation routes for the existing Piper/FastAPI service.
 
 Mount in Piper's FastAPI application:
     from piper_pdf_router import router as pdf_router
@@ -27,8 +27,10 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
 from xml.sax.saxutils import escape
+import csv, json, zipfile, html
 
 router = APIRouter(prefix="/pdf", tags=["PDF documents"])
+files_router = APIRouter(prefix="/files", tags=["General file generation"])
 MAX_PDF_BYTES = 15 * 1024 * 1024
 MAX_TEXT_CHARS = 100_000
 
@@ -151,3 +153,146 @@ def extract_pdf(payload: ExtractRequest, x_api_key: str | None = Header(default=
         "text": extracted[:MAX_TEXT_CHARS],
         "hasExtractableText": bool(extracted),
     }
+
+
+class GeneralFileRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=160)
+    content: str | None = Field(default=None, max_length=2_000_000)
+    files: list[dict[str, str]] | None = Field(default=None, max_length=100)
+    title: str = Field(default="JARVIS File", max_length=160)
+
+MIME_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "csv": "text/csv; charset=utf-8", "txt": "text/plain; charset=utf-8", "md": "text/markdown; charset=utf-8",
+    "html": "text/html; charset=utf-8", "json": "application/json; charset=utf-8", "xml": "application/xml; charset=utf-8",
+    "yaml": "text/yaml; charset=utf-8", "yml": "text/yaml; charset=utf-8", "css": "text/css; charset=utf-8", "js": "text/javascript; charset=utf-8",
+    "py": "text/x-python; charset=utf-8", "php": "application/x-httpd-php; charset=utf-8", "java": "text/x-java-source; charset=utf-8",
+    "cpp": "text/x-c++src; charset=utf-8", "sql": "application/sql; charset=utf-8", "svg": "image/svg+xml", "zip": "application/zip",
+    "rtf": "application/rtf; charset=utf-8", "ts": "text/typescript; charset=utf-8", "tsx": "text/typescript; charset=utf-8", "jsx": "text/javascript; charset=utf-8",
+    "c": "text/x-c; charset=utf-8", "h": "text/x-c; charset=utf-8", "cs": "text/plain; charset=utf-8", "go": "text/plain; charset=utf-8",
+    "rs": "text/plain; charset=utf-8", "rb": "text/plain; charset=utf-8", "sh": "text/x-shellscript; charset=utf-8", "ps1": "text/plain; charset=utf-8",
+    "bat": "text/plain; charset=utf-8", "toml": "application/toml; charset=utf-8", "ini": "text/plain; charset=utf-8", "conf": "text/plain; charset=utf-8",
+    "properties": "text/plain; charset=utf-8", "tex": "application/x-tex; charset=utf-8", "mdx": "text/markdown; charset=utf-8", "jsonl": "application/x-ndjson; charset=utf-8"
+}
+
+def _safe_general_name(value: str) -> str:
+    name = Path(value).name
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")[:120]
+    if not name or "." not in name:
+        raise HTTPException(status_code=400, detail="A filename with a supported extension is required")
+    return name
+
+def _make_general_file(payload: GeneralFileRequest, ext: str) -> bytes:
+    content = payload.content or ""
+    if ext == "pdf":
+        return _make_pdf(payload.title, content)
+    if ext == "rtf":
+        escaped = content.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", r"\par " )
+        return (r"{\rtf1\ansi\deff0 " + escaped + "}").encode("utf-8")
+    if ext == "jsonl":
+        for line in content.splitlines():
+            if line.strip():
+                try: json.loads(line)
+                except Exception as exc: raise HTTPException(status_code=422, detail="Each JSONL line must contain valid JSON") from exc
+    if ext == "zip":
+        if not payload.files:
+            raise HTTPException(status_code=400, detail="ZIP creation requires a files array")
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            seen_paths = set()
+            total_bytes = 0
+            for item in payload.files:
+                rel = str(item.get("path", ""))
+                value = str(item.get("content", ""))
+                if not rel or rel.startswith("/") or "\\" in rel or "\0" in rel or any(part in {"", ".", ".."} for part in Path(rel).parts):
+                    raise HTTPException(status_code=400, detail="ZIP contains an unsafe file path")
+                if rel in seen_paths:
+                    raise HTTPException(status_code=400, detail="ZIP contains a duplicate file path")
+                seen_paths.add(rel)
+                item_bytes = len(value.encode("utf-8"))
+                if item_bytes > 1_000_000:
+                    raise HTTPException(status_code=413, detail="A ZIP member exceeds the 1 MB limit")
+                total_bytes += item_bytes
+                if total_bytes > 8 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="ZIP source files exceed the 8 MB total limit")
+                archive.writestr(rel, value)
+        return output.getvalue()
+    if ext == "docx":
+        from docx import Document
+        doc = Document(); doc.add_heading(payload.title, 0)
+        for line in content.splitlines():
+            if line.startswith("### "): doc.add_heading(line[4:], level=3)
+            elif line.startswith("## "): doc.add_heading(line[3:], level=2)
+            elif line.startswith("# "): doc.add_heading(line[2:], level=1)
+            elif line.startswith(("- ", "* ")): doc.add_paragraph(line[2:], style="List Bullet")
+            elif line.strip(): doc.add_paragraph(line)
+        output = BytesIO(); doc.save(output); return output.getvalue()
+    if ext == "xlsx":
+        from openpyxl import Workbook
+        data = json.loads(content); wb = Workbook(); ws = wb.active; ws.title = "Data"
+        sheets = data.get("sheets") if isinstance(data, dict) else None
+        if sheets:
+            for index, sheet in enumerate(sheets):
+                ws = wb.active if index == 0 else wb.create_sheet()
+                ws.title = re.sub(r"[\\/*?:\[\]]", "_", str(sheet.get("name", f"Sheet{index+1}")))[:31]
+                if sheet.get("headers"): ws.append(sheet["headers"])
+                for row in sheet.get("rows", []): ws.append(row)
+        elif isinstance(data, dict) and "headers" in data:
+            ws.append(data.get("headers", []))
+            for row in data.get("rows", []): ws.append(row)
+        elif isinstance(data, list):
+            if data and isinstance(data[0], dict):
+                headers = list(data[0].keys()); ws.append(headers)
+                for item in data: ws.append([item.get(k) for k in headers])
+            else:
+                for row in data: ws.append(row if isinstance(row, list) else [row])
+        else: raise HTTPException(status_code=422, detail="Excel content must be JSON tabular data")
+        output = BytesIO(); wb.save(output); return output.getvalue()
+    if ext == "pptx":
+        from pptx import Presentation
+        data = json.loads(content); prs = Presentation()
+        for slide_data in data.get("slides", []):
+            slide = prs.slides.add_slide(prs.slide_layouts[1 if slide_data.get("bullets") else 5])
+            if slide.shapes.title: slide.shapes.title.text = str(slide_data.get("title", ""))
+            body = slide.placeholders[1] if len(slide.placeholders) > 1 else None
+            if body:
+                tf = body.text_frame; tf.clear()
+                bullets = slide_data.get("bullets") or ([slide_data.get("body", "")] if slide_data.get("body") else [])
+                for i, bullet in enumerate(bullets):
+                    para = tf.paragraphs[0] if i == 0 else tf.add_paragraph(); para.text = str(bullet); para.level = 0
+        output = BytesIO(); prs.save(output); return output.getvalue()
+    if ext == "csv":
+        data = json.loads(content); output = BytesIO(); import io
+        text_stream = io.StringIO(newline=""); writer = csv.writer(text_stream)
+        if isinstance(data, dict):
+            if data.get("headers"): writer.writerow(data["headers"])
+            writer.writerows(data.get("rows", []))
+        elif isinstance(data, list):
+            if data and isinstance(data[0], dict):
+                headers = list(data[0].keys()); writer.writerow(headers)
+                for row in data: writer.writerow([row.get(key, "") for key in headers])
+            else: writer.writerows(data)
+        return text_stream.getvalue().encode("utf-8-sig")
+    if ext in {"html", "svg"}: content = re.sub(r"(?is)<(script|iframe|object|embed)\b[^>]*>.*?</\1\s*>", "", content); content = re.sub(r"(?i)\son\w+\s*=\s*([\"']).*?\1", "", content); content = re.sub(r"(?i)(href|src)\s*=\s*([\"\'])\s*(?:javascript:|data:text/html)[^\"\']*\2", r"\1=\2#\2", content)
+    if ext == "json":
+        try: content = json.dumps(json.loads(content), ensure_ascii=False, indent=2)
+        except Exception as exc: raise HTTPException(status_code=422, detail="The supplied JSON is invalid") from exc
+    if ext in {"txt", "md", "html", "json", "xml", "yaml", "yml", "css", "js", "py", "php", "java", "cpp", "sql", "svg", "ts", "tsx", "jsx", "c", "h", "cs", "go", "rs", "rb", "sh", "ps1", "bat", "toml", "ini", "conf", "properties", "tex", "mdx", "jsonl"}:
+        return content.encode("utf-8")
+    raise HTTPException(status_code=415, detail=f"Unsupported file extension: .{ext}")
+
+@files_router.post("/generate")
+def generate_general_file(payload: GeneralFileRequest, x_api_key: str | None = Header(default=None)):
+    _authorize(x_api_key)
+    filename = _safe_general_name(payload.filename)
+    ext = Path(filename).suffix.lower().lstrip(".")
+    if ext not in MIME_TYPES:
+        raise HTTPException(status_code=415, detail=f"Unsupported file extension: .{ext}")
+    try: raw = _make_general_file(payload, ext)
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(status_code=422, detail=f"Could not generate {ext.upper()} file: {type(exc).__name__}") from exc
+    if len(raw) > 15 * 1024 * 1024: raise HTTPException(status_code=413, detail="Generated file exceeds the 15 MB limit")
+    return {"success": True, "filename": filename, "mimeType": MIME_TYPES[ext], "fileBase64": base64.b64encode(raw).decode("ascii")}

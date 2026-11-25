@@ -27,7 +27,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
 from xml.sax.saxutils import escape
-import csv, json, zipfile, html
+import csv, json, zipfile, html, ast, tomllib, yaml
+import xml.etree.ElementTree as ET
 
 router = APIRouter(prefix="/pdf", tags=["PDF documents"])
 files_router = APIRouter(prefix="/files", tags=["General file generation"])
@@ -277,6 +278,18 @@ def _make_general_file(payload: GeneralFileRequest, ext: str) -> bytes:
             else: writer.writerows(data)
         return text_stream.getvalue().encode("utf-8-sig")
     if ext in {"html", "svg"}: content = re.sub(r"(?is)<(script|iframe|object|embed)\b[^>]*>.*?</\1\s*>", "", content); content = re.sub(r"(?i)\son\w+\s*=\s*([\"']).*?\1", "", content); content = re.sub(r"(?i)(href|src)\s*=\s*([\"\'])\s*(?:javascript:|data:text/html)[^\"\']*\2", r"\1=\2#\2", content)
+    if ext in {"xml", "svg"}:
+        try: ET.fromstring(content)
+        except ET.ParseError as exc: raise HTTPException(status_code=422, detail="The supplied XML/SVG is not well-formed") from exc
+    if ext in {"yaml", "yml"}:
+        try: yaml.safe_load(content)
+        except yaml.YAMLError as exc: raise HTTPException(status_code=422, detail="The supplied YAML is invalid") from exc
+    if ext == "toml":
+        try: tomllib.loads(content)
+        except tomllib.TOMLDecodeError as exc: raise HTTPException(status_code=422, detail="The supplied TOML is invalid") from exc
+    if ext == "py":
+        try: ast.parse(content)
+        except SyntaxError as exc: raise HTTPException(status_code=422, detail="The supplied Python source has a syntax error") from exc
     if ext == "json":
         try: content = json.dumps(json.loads(content), ensure_ascii=False, indent=2)
         except Exception as exc: raise HTTPException(status_code=422, detail="The supplied JSON is invalid") from exc
